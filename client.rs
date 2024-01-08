@@ -1,175 +1,139 @@
-use std::{
-    io,
-    net::{SocketAddr, UdpSocket},
-    time::Duration,
-};
+use bevy::prelude::*;
+use network_plugin::network_channels::{DefaultChannel, BitsClient};
+use serde_json::json;
 
-use network_core::{
-    ConnectToken, DisconnectReason, NetcodeClient, NetcodeError, NETCODE_KEY_BYTES, NETCODE_MAX_PACKET_BYTES, NETCODE_USER_DATA_BYTES,
-};
+use crate::components::{player::Player, game::Health, self, other_player::other_player, enemy::Enemy, room::{Button, Door, Carpet, Wall, CloseDoor}};
+use crate::network::packets::{ClientPacket, ServerPacket, CurrentKey};
 
-use crate::remote_connection::BitsClient;
+pub fn client_send(
+    input: Res<Input<KeyCode>>,
+    mouse: Res<Input<MouseButton>>,
+    mut client: ResMut<BitsClient>,
+){
+    let mut mouse_pressed = false;
+    let mut key: String = "".to_string();
 
-use super::NetcodeTransportError;
+    if get_mouse(mouse) == true {
+        mouse_pressed = true;
+    }
 
-// Configuration to establish an secure ou unsecure connection with the server.
-#[derive(Debug)]
-pub enum ClientAuthentication {
-    // Establishes a safe connection with the server using the [crate::transport::ConnectToken].
-    Secure { connect_token: ConnectToken },
-    // Establishes an unsafe connection with the server, useful for testing and prototyping.
-    Unsecure {
-        protocol_id: u64,
-        client_id: u64,
-        server_addr: SocketAddr,
-        user_data: Option<[u8; NETCODE_USER_DATA_BYTES]>,
-    },
+    if input.pressed(KeyCode::W) {
+        key = "W".to_string();
+    }
+    else if input.pressed(KeyCode::A) {
+        key = "A".to_string();
+    }
+    else if input.pressed(KeyCode::S) {
+        key = "S".to_string();
+    }
+    else if input.pressed(KeyCode::D) {
+        key = "D".to_string();
+    }
+
+    let information = json!({
+        "client_id": 0,
+        "key": key,
+        "mouse_pressed": mouse_pressed,
+    });
+
+    send_message_system(client, information.to_string());
 }
 
-#[derive(Debug, bevy_ecs::system::Resource)]
-pub struct NetcodeClientTransport {
-    socket: UdpSocket,
-    netcode_client: NetcodeClient,
-    buffer: [u8; NETCODE_MAX_PACKET_BYTES],
+fn get_pressed_key(
+    input: Res<Input<KeyCode>>,
+) -> KeyCode{
+
+    for key in input.get_pressed() {
+        return key.clone();
+    }
+
+    return KeyCode::Space;
 }
 
-impl NetcodeClientTransport {
-    pub fn new(current_time: Duration, authentication: ClientAuthentication, socket: UdpSocket) -> Result<Self, NetcodeError> {
-        socket.set_nonblocking(true)?;
-        let connect_token: ConnectToken = match authentication {
-            ClientAuthentication::Unsecure {
-                server_addr,
-                protocol_id,
-                client_id,
-                user_data,
-            } => ConnectToken::generate(
-                current_time,
-                protocol_id,
-                300,
-                client_id,
-                15,
-                vec![server_addr],
-                user_data.as_ref(),
-                &[0; NETCODE_KEY_BYTES],
-            )?,
-            ClientAuthentication::Secure { connect_token } => connect_token,
-        };
-
-        let netcode_client = NetcodeClient::new(current_time, connect_token);
-
-        Ok(Self {
-            buffer: [0u8; NETCODE_MAX_PACKET_BYTES],
-            socket,
-            netcode_client,
-        })
+fn get_mouse(
+    input: Res<Input<MouseButton>>,
+) -> bool{
+    if input.just_pressed(MouseButton::Left) {
+        return true;
     }
 
-    pub fn addr(&self) -> io::Result<SocketAddr> {
-        self.socket.local_addr()
-    }
+    return false;
+}
 
-    pub fn client_id(&self) -> u64 {
-        self.netcode_client.client_id()
-    }
-
-    pub fn is_connecting(&self) -> bool {
-        self.netcode_client.is_connecting()
-    }
-
-    pub fn is_connected(&self) -> bool {
-        self.netcode_client.is_connected()
-    }
-
-    pub fn is_disconnected(&self) -> bool {
-        self.netcode_client.is_disconnected()
-    }
-
-    // Returns the duration since the client last received a packet.
-    // Usefull to detect timeouts.
-    pub fn time_since_last_received_packet(&self) -> Duration {
-        self.netcode_client.time_since_last_received_packet()
-    }
-
-    // Disconnect the client from the transport layer.
-    // This sends the disconnect packet instantly, use this when closing/exiting games,
-    // should use [BitsClient::disconnect][crate::BitsClient::disconnect] otherwise.
-    pub fn disconnect(&mut self) {
-        if self.netcode_client.is_disconnected() {
-            return;
-        }
-
-        match self.netcode_client.disconnect() {
-            Ok((addr, packet)) => {
-                if let Err(e) = self.socket.send_to(packet, addr) {
-                    println!("Failed to send disconnect packet: {e}");
+fn client_receive(
+    incoming: ServerPacket,
+    mut commands: Commands,
+    mut query: Query<(Entity, &mut Transform, Option<&mut Button>, Option<&other_player>, Option<&Enemy>, Option<&mut Health>)>,
+) {
+    // Iterate through all entities
+    for (entity, mut transform, mut button, other_player, enemy, mut health) in query.iter_mut() {
+        // If the entity is a player
+        if let Some(other_player) = other_player {
+            // Iterate through all positions in the packet
+            for position in incoming.positions.iter() {
+                // If the position is for this player
+                if position.0 == other_player.id {
+                    // Move the player
+                    transform.translation = position.2;
                 }
             }
-            Err(e) => println!("Failed to generate disconnect packet: {e}"),
         }
-    }
-
-    // If the client is disconnected, returns the reason.
-    pub fn disconnect_reason(&self) -> Option<DisconnectReason> {
-        self.netcode_client.disconnect_reason()
-    }
-
-    // Send packets to the server.
-    // Should be called every tick
-    pub fn send_packets(&mut self, connection: &mut BitsClient) -> Result<(), NetcodeTransportError> {
-        if let Some(reason) = self.netcode_client.disconnect_reason() {
-            return Err(NetcodeError::Disconnected(reason).into());
-        }
-
-        let packets = connection.get_packets_to_send();
-        for packet in packets {
-            let (addr, payload) = self.netcode_client.generate_payload_packet(&packet)?;
-            self.socket.send_to(payload, addr)?;
-        }
-
-        Ok(())
-    }
-
-    // Advances the transport by the duration, and receive packets from the network.
-    pub fn update(&mut self, duration: Duration, client: &mut BitsClient) -> Result<(), NetcodeTransportError> {
-        if let Some(reason) = self.netcode_client.disconnect_reason() {
-            // Mark the client as disconnected if an error occured in the transport layer
-            if !client.is_disconnected() {
-                client.disconnect_due_to_transport();
+        // If the entity is an enemy
+        if let Some(enemy) = enemy {
+            // Iterate through all positions in the packet
+            for position in incoming.positions.iter() {
+                // If the position is for this enemy
+                if position.0 == 999 {
+                    // Move the enemy
+                    transform.translation = position.2;
+                }
             }
-
-            return Err(NetcodeError::Disconnected(reason).into());
         }
-
-        if let Some(error) = client.disconnect_reason() {
-            let (addr, disconnect_packet) = self.netcode_client.disconnect()?;
-            self.socket.send_to(disconnect_packet, addr)?;
-            return Err(error.into());
-        }
-
-        loop {
-            let packet = match self.socket.recv_from(&mut self.buffer) {
-                Ok((len, addr)) => {
-                    if addr != self.netcode_client.server_addr() {
-                        println!("Discarded packet from unknown server {:?}", addr);
-                        continue;
+        // if the entity has health
+        if let Some(mut health) = health {
+            // check if the entity is a player or enemy
+            if let Some(other_player) = other_player {
+                // Iterate through all healths in the packet
+                for healths in incoming.healths.iter() {
+                    // If the health is for this entity
+                    if healths.0 == other_player.id {
+                        // Set the health
+                        health.current = healths.2;
                     }
-
-                    &mut self.buffer[..len]
                 }
-                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => break,
-                Err(e) => return Err(NetcodeTransportError::IO(e)),
-            };
-
-            if let Some(payload) = self.netcode_client.process_packet(packet) {
-                client.process_packet(payload);
+            }
+            // check if the entity is a player or enemy
+            if let Some(enemy) = enemy {
+                // Iterate through all healths in the packet
+                for healths in incoming.healths.iter() {
+                    // If the health is for this entity
+                    if healths.0 == 999 {
+                        // Set the health
+                        health.current = healths.2;
+                    }
+                }
             }
         }
-
-        if let Some((packet, addr)) = self.netcode_client.update(duration) {
-            self.socket.send_to(packet, addr)?;
+        // If the entity is a button
+        if let Some(mut button) = button {
+            // Set the state of the button
+            button.pressed = incoming.button;
         }
+    }
+}
 
-        Ok(())
+// pub fn send_message_system(mut client: ResMut<BitsClient>,input: Res<Input<KeyCode>>,mouse: Res<Input<MouseButton>>) {
+//     // Send a text message to the server
+//     client.send_message(DefaultChannel::ReliableOrdered, client_send(input,mouse));
+// }
+
+pub fn send_message_system(mut client: ResMut<BitsClient>, message: String) {
+        // Send a text message to the server
+        client.send_message(DefaultChannel::ReliableOrdered, message);
+    }
+
+pub fn receive_message_system(mut client: ResMut<BitsClient>) {
+    while let Some(message) = client.receive_message(DefaultChannel::ReliableOrdered) {
+        // Handle received message
     }
 }
