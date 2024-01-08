@@ -1,8 +1,9 @@
-[workspace]
+[package]
+name = "network_core"
+version = "0.1.0"
+edition = "2021"
 
-members = [
-    "game",
-    "network_channels",
-    "network_core",
-    "network_plugin",
-]
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+rand = "0.8.5"
