@@ -1,76 +1,74 @@
-use std::{error, fmt, io};
+use std::fmt;
 
-use crate::{token::TokenGenerationError, DisconnectReason, NETCODE_MAX_PAYLOAD_BYTES};
+use crate::packet::SerializationError;
 
-// Errors from the network_core crate.
-#[derive(Debug)]
-pub enum NetcodeError {
-    // No private keys was available while decrypting.
-    UnavailablePrivateKey,
-    // The type of the packet is invalid.
-    InvalidPacketType,
-    // The connect token has an invalid protocol id.
-    InvalidProtocolID,
-    // The connect token has an invalid version.
-    InvalidVersion,
-    // Packet size is too small to be a netcode packet.
-    PacketTooSmall,
-    // Payload is above the maximum limit
-    PayloadAboveLimit,
-    // The processed packet is duplicated
-    DuplicatedSequence,
-    // No more host are available in the connect token..
-    NoMoreServers,
-    // The connect token has expired.
-    Expired,
-    // The client is disconnected.
-    Disconnected(DisconnectReason),
-    // The server address is not in the connect token.
-    NotInHostList,
-    // Client was not found.
-    ClientNotFound,
-    // Client is not connected.
-    ClientNotConnected,
-    // IO error.
-    IoError(io::Error),
-    // An error occured while generating the connect token.
-    TokenGenerationError(TokenGenerationError),
+// Possibles reasons for a disconnection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DisconnectReason {
+    // Connection was terminated by the transport layer
+    Transport,
+    // Connection was terminated by the server
+    DisconnectedByClient,
+    // Connection was terminated by the server
+    DisconnectedByServer,
+    // Failed to serialize packet
+    PacketSerialization(SerializationError),
+    // Failed to deserialize packet
+    PacketDeserialization(SerializationError),
+    // Received message from channel with invalid id
+    ReceivedInvalidChannelId(u8),
+    // Error occurred in a send channel
+    SendChannelError { channel_id: u8, error: ChannelError },
+    // Error occurred in a receive channel
+    ReceiveChannelError { channel_id: u8, error: ChannelError },
 }
 
-impl fmt::Display for NetcodeError {
+// Possibles errors that can occur in a channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChannelError {
+    // Reliable channel reached maximum allowed memory
+    ReliableChannelMaxMemoryReached,
+    // Received an invalid slice message in the channel.
+    InvalidSliceMessage,
+}
+
+impl fmt::Display for ChannelError {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
-        use NetcodeError::*;
+        use ChannelError::*;
 
         match *self {
-            UnavailablePrivateKey => write!(fmt, "no private key was found for this address"),
-            InvalidPacketType => write!(fmt, "invalid packet type"),
-            InvalidProtocolID => write!(fmt, "invalid protocol id"),
-            InvalidVersion => write!(fmt, "invalid version info"),
-            PacketTooSmall => write!(fmt, "packet is too small"),
-            PayloadAboveLimit => write!(fmt, "payload is above the {} bytes limit", NETCODE_MAX_PAYLOAD_BYTES),
-            Expired => write!(fmt, "connection expired"),
-            DuplicatedSequence => write!(fmt, "sequence already received"),
-            Disconnected(reason) => write!(fmt, "disconnected: {}", reason),
-            NoMoreServers => write!(fmt, "client has no more servers to connect"),
-            NotInHostList => write!(fmt, "token does not contain the server address"),
-            ClientNotFound => write!(fmt, "client was not found"),
-            ClientNotConnected => write!(fmt, "client is disconnected or connecting"),
-            IoError(ref err) => write!(fmt, "{}", err),
-            TokenGenerationError(ref err) => write!(fmt, "{}", err),
+            ReliableChannelMaxMemoryReached => write!(fmt, "reliable channel memory usage was exausted"),
+            InvalidSliceMessage => write!(fmt, "received an invalid slice packet"),
         }
     }
 }
 
-impl error::Error for NetcodeError {}
+impl fmt::Display for DisconnectReason {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        use DisconnectReason::*;
 
-impl From<io::Error> for NetcodeError {
-    fn from(inner: io::Error) -> Self {
-        NetcodeError::IoError(inner)
+        match *self {
+            Transport => write!(fmt, "connection terminated by the transport layer"),
+            DisconnectedByClient => write!(fmt, "connection terminated by the client"),
+            DisconnectedByServer => write!(fmt, "connection terminated by the server"),
+            PacketSerialization(err) => write!(fmt, "failed to serialize packet: {err}"),
+            PacketDeserialization(err) => write!(fmt, "failed to deserialize packet: {err}"),
+            ReceivedInvalidChannelId(id) => write!(fmt, "received message with invalid channel {id}"),
+            SendChannelError { channel_id, error } => write!(fmt, "send channel {channel_id} with error: {error}"),
+            ReceiveChannelError { channel_id, error } => write!(fmt, "receive channel {channel_id} with error: {error}"),
+        }
     }
 }
 
-impl From<TokenGenerationError> for NetcodeError {
-    fn from(inner: TokenGenerationError) -> Self {
-        NetcodeError::TokenGenerationError(inner)
+impl std::error::Error for ChannelError {}
+
+#[derive(Debug)]
+pub struct ClientNotFound;
+
+impl std::error::Error for ClientNotFound {}
+
+impl fmt::Display for ClientNotFound {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        write!(fmt, "client with given id was not found")
     }
 }

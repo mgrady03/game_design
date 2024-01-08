@@ -1,349 +1,352 @@
-use std::io::{self, Cursor, Write};
+use bytes::Bytes;
+use std::{fmt, ops::Range};
 
-use crate::token::ConnectToken;
-use crate::{
-    serialize::*, NetcodeError, NETCODE_CHALLENGE_TOKEN_BYTES, NETCODE_CONNECT_TOKEN_PRIVATE_BYTES, NETCODE_CONNECT_TOKEN_XNONCE_BYTES,
-    NETCODE_KEY_BYTES, NETCODE_MAC_BYTES,
-};
-use crate::{NETCODE_USER_DATA_BYTES, NETCODE_VERSION_INFO};
+pub type Payload = Vec<u8>;
 
-#[derive(Debug)]
-pub enum PacketType {
-    ConnectionRequest = 0,
-    ConnectionDenied = 1,
-    Challenge = 2,
-    Response = 3,
-    KeepAlive = 4,
-    Payload = 5,
-    Disconnect = 6,
+// Sliced messages are split into SLICE_SIZE bytes chunks
+pub const SLICE_SIZE: usize = 1200;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Slice {
+    pub message_id: u64,
+    pub slice_index: usize,
+    pub num_slices: usize,
+    pub payload: Bytes,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum Packet<'a> {
-    ConnectionRequest {
-        version_info: [u8; 13], // "NETCODE 1.02" ASCII with null terminator.
-        protocol_id: u64,
-        expire_timestamp: u64,
-        xnonce: [u8; NETCODE_CONNECT_TOKEN_XNONCE_BYTES],
-        data: [u8; NETCODE_CONNECT_TOKEN_PRIVATE_BYTES],
+pub enum Packet {
+    // Small messages in a reliable channel are aggregated and sent in this packet
+    SmallReliable {
+        sequence: u64,
+        channel_id: u8,
+        messages: Vec<(u64, Bytes)>,
     },
-    ConnectionDenied,
-    Challenge {
-        token_sequence: u64,
-        token_data: [u8; NETCODE_CHALLENGE_TOKEN_BYTES], // encrypted ChallengeToken
+    // Small messages in a unreliable channel are aggregated and sent in this packet
+    SmallUnreliable {
+        sequence: u64,
+        channel_id: u8,
+        messages: Vec<Bytes>,
     },
-    Response {
-        token_sequence: u64,
-        token_data: [u8; NETCODE_CHALLENGE_TOKEN_BYTES], // encrypted ChallengeToken
+    // A big unreliable message is sliced in multiples slice packets
+    UnreliableSlice {
+        sequence: u64,
+        channel_id: u8,
+        slice: Slice,
     },
-    KeepAlive {
-        client_index: u32,
-        max_clients: u32,
+    // A big reliable messages is sliced in multiples slice packets
+    ReliableSlice {
+        sequence: u64,
+        channel_id: u8,
+        slice: Slice,
     },
-    Payload(&'a [u8]),
-    Disconnect,
+    // Contains the packets that were acked
+    // Acks are saved in multiples ranges, all values in the ranges are considered acked.
+    Ack {
+        sequence: u64,
+        ack_ranges: Vec<Range<u64>>,
+    },
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub struct ChallengeToken {
-    pub client_id: u64,
-    pub user_data: [u8; 256],
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SerializationError {
+    BufferTooShort,
+    InvalidNumSlices,
+    SliceSizeAboveLimit,
+    EmptySlice,
+    InvalidAckRange,
+    InvalidPacketType,
 }
 
-impl PacketType {
-    fn from_u8(value: u8) -> Result<Self, NetcodeError> {
-        use PacketType::*;
+impl std::error::Error for SerializationError {}
 
-        let packet_type = match value {
-            0 => ConnectionRequest,
-            1 => ConnectionDenied,
-            2 => Challenge,
-            3 => Response,
-            4 => KeepAlive,
-            5 => Payload,
-            6 => Disconnect,
-            _ => return Err(NetcodeError::InvalidPacketType),
-        };
-        Ok(packet_type)
+impl fmt::Display for SerializationError {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
+        use SerializationError::*;
+
+        match *self {
+            BufferTooShort => write!(fmt, "buffer too short"),
+            InvalidNumSlices => write!(fmt, "invalid number of slices"),
+            InvalidAckRange => write!(fmt, "invalid ack range"),
+            InvalidPacketType => write!(fmt, "invalid packet type"),
+            SliceSizeAboveLimit => write!(fmt, "invalid slice size, it's above the limit of {} bytes", SLICE_SIZE),
+            EmptySlice => write!(fmt, "invalid slice, slices cannot be empty"),
+        }
     }
 }
 
-impl<'a> Packet<'a> {
-    pub fn packet_type(&self) -> PacketType {
+impl From<octets::BufferTooShortError> for SerializationError {
+    fn from(_: octets::BufferTooShortError) -> Self {
+        SerializationError::BufferTooShort
+    }
+}
+
+impl Packet {
+    pub fn sequence(&self) -> u64 {
         match self {
-            Packet::ConnectionRequest { .. } => PacketType::ConnectionRequest,
-            Packet::ConnectionDenied => PacketType::ConnectionDenied,
-            Packet::Challenge { .. } => PacketType::Challenge,
-            Packet::Response { .. } => PacketType::Response,
-            Packet::KeepAlive { .. } => PacketType::KeepAlive,
-            Packet::Payload { .. } => PacketType::Payload,
-            Packet::Disconnect => PacketType::Disconnect,
+            Packet::SmallReliable { sequence, .. }
+            | Packet::SmallUnreliable { sequence, .. }
+            | Packet::UnreliableSlice { sequence, .. }
+            | Packet::ReliableSlice { sequence, .. }
+            | Packet::Ack { sequence, .. } => *sequence,
         }
     }
 
-    pub fn id(&self) -> u8 {
-        self.packet_type() as u8
-    }
+    pub fn to_bytes(&self, b: &mut octets::OctetsMut) -> Result<usize, SerializationError> {
+        let before = b.cap();
 
-    pub fn connection_request_from_token(connect_token: &ConnectToken) -> Self {
-        Packet::ConnectionRequest {
-            xnonce: connect_token.xnonce,
-            version_info: *NETCODE_VERSION_INFO,
-            protocol_id: connect_token.protocol_id,
-            expire_timestamp: connect_token.expire_timestamp,
-            data: connect_token.private_data,
-        }
-    }
-
-    pub fn generate_challenge(
-        client_id: u64,
-        user_data: &[u8; NETCODE_USER_DATA_BYTES],
-        challenge_sequence: u64,
-        challenge_key: &[u8; NETCODE_KEY_BYTES],
-    ) -> Result<Self, NetcodeError> {
-        let token = ChallengeToken::new(client_id, user_data);
-        let mut buffer = [0u8; NETCODE_CHALLENGE_TOKEN_BYTES];
-        token.write(&mut Cursor::new(&mut buffer[..]))?;
-
-        Ok(Packet::Challenge {
-            token_sequence: challenge_sequence,
-            token_data: buffer,
-        })
-    }
-
-    fn write(&self, writer: &mut impl io::Write) -> Result<(), io::Error> {
         match self {
-            Packet::ConnectionRequest {
-                version_info,
-                protocol_id,
-                expire_timestamp,
-                xnonce,
-                data,
+            Packet::SmallReliable {
+                sequence,
+                channel_id,
+                messages,
             } => {
-                writer.write_all(version_info)?;
-                writer.write_all(&protocol_id.to_le_bytes())?;
-                writer.write_all(&expire_timestamp.to_le_bytes())?;
-                writer.write_all(xnonce)?;
-                writer.write_all(data)?;
+                b.put_u8(0)?;
+                b.put_varint(*sequence)?;
+                b.put_u8(*channel_id)?;
+                b.put_u16(messages.len() as u16)?;
+                for (message_id, message) in messages {
+                    b.put_varint(*message_id)?;
+                    b.put_varint(message.len() as u64)?;
+                    b.put_bytes(message)?;
+                }
             }
-            Packet::Challenge {
-                token_data,
-                token_sequence,
-            }
-            | Packet::Response {
-                token_data,
-                token_sequence,
+            Packet::SmallUnreliable {
+                sequence,
+                channel_id,
+                messages,
             } => {
-                writer.write_all(&token_sequence.to_le_bytes())?;
-                writer.write_all(token_data)?;
+                b.put_u8(1)?;
+                b.put_varint(*sequence)?;
+                b.put_u8(*channel_id)?;
+                b.put_u16(messages.len() as u16)?;
+                for message in messages {
+                    b.put_varint(message.len() as u64)?;
+                    b.put_bytes(message)?;
+                }
             }
-            Packet::KeepAlive { max_clients, client_index } => {
-                writer.write_all(&client_index.to_le_bytes())?;
-                writer.write_all(&max_clients.to_le_bytes())?;
+            Packet::ReliableSlice {
+                sequence,
+                channel_id,
+                slice,
+            } => {
+                b.put_u8(2)?;
+                b.put_varint(*sequence)?;
+                b.put_u8(*channel_id)?;
+                b.put_varint(slice.message_id)?;
+                b.put_varint(slice.slice_index as u64)?;
+                b.put_varint(slice.num_slices as u64)?;
+                b.put_varint(slice.payload.len() as u64)?;
+                b.put_bytes(&slice.payload)?;
             }
-            Packet::Payload(p) => {
-                writer.write_all(p)?;
+            Packet::UnreliableSlice {
+                sequence,
+                channel_id,
+                slice,
+            } => {
+                b.put_u8(3)?;
+                b.put_varint(*sequence)?;
+                b.put_u8(*channel_id)?;
+                b.put_varint(slice.message_id)?;
+                b.put_varint(slice.slice_index as u64)?;
+                b.put_varint(slice.num_slices as u64)?;
+                b.put_varint(slice.payload.len() as u64)?;
+                b.put_bytes(&slice.payload)?;
             }
-            Packet::ConnectionDenied | Packet::Disconnect => {}
+            Packet::Ack { sequence, ack_ranges } => {
+                b.put_u8(4)?;
+                b.put_varint(*sequence)?;
+
+                // Consider this ranges:
+                // [20010..20020   ,  20035..20040]
+                //  <----10----><-15-><----5------>
+                //
+                // We can represented more compactly each range if we serialize it based
+                // on the start of the previous one, since the difference is usually small
+                // The ranges would become before serializing:
+                // 20040 5 1 15 10
+                //   |   | |  |  |
+                //   |   | |  |  +-> 10: size of 20010..20020
+                //   |   | |  +----> 15: gap between ranges 20010..20020 and 20035..20040
+                //   |   | +--------> 1: remaing number of ranges
+                //   |   +----------> 5: size of 20035..20040
+                //   +----------> 20040:  end of 20035..20040
+                //
+                // We can always reconstruct the ranges using the start of the previous one and the gap.
+
+                // Iterate in reverse order
+                let mut it = ack_ranges.iter().rev();
+
+                // Extract the last range (first in the iterator)
+                let last = it.next().unwrap();
+                let last_range_size = (last.end - 1) - last.start;
+
+                b.put_varint(last.end - 1)?;
+                b.put_varint(last_range_size)?;
+
+                // Write the number of remaining ranges
+                b.put_varint(it.len() as u64)?;
+
+                let mut previous_range_start = last.start;
+                // For each subsequent range:
+                for range in it {
+                    // Calculate the gap between the start of the previous range and the end of the current range
+                    let gap = previous_range_start - range.end - 1;
+                    let range_size = (range.end - 1) - range.start;
+
+                    b.put_varint(gap)?;
+                    b.put_varint(range_size)?;
+
+                    previous_range_start = range.start;
+                }
+            }
         }
 
-        Ok(())
+        Ok(before - b.cap())
     }
 
-    fn read(packet_type: PacketType, src: &'a [u8]) -> Result<Self, io::Error> {
-        if matches!(packet_type, PacketType::Payload) {
-            return Ok(Packet::Payload(src));
-        }
-
-        let src = &mut Cursor::new(src);
-
+    pub fn from_bytes(b: &mut octets::Octets) -> Result<Packet, SerializationError> {
+        let packet_type = b.get_u8()?;
         match packet_type {
-            PacketType::ConnectionRequest => {
-                let version_info = read_bytes(src)?;
-                let protocol_id = read_u64(src)?;
-                let expire_timestamp = read_u64(src)?;
-                let xnonce = read_bytes(src)?;
-                let token_data = read_bytes(src)?;
+            0 => {
+                // SmallReliable
+                let sequence = b.get_varint()?;
+                let channel_id = b.get_u8()?;
+                let messages_len = b.get_u16()?;
+                let mut messages: Vec<(u64, Bytes)> = Vec::with_capacity(64);
+                for _ in 0..messages_len {
+                    let message_id = b.get_varint()?;
+                    let payload = b.get_bytes_with_varint_length()?;
 
-                Ok(Packet::ConnectionRequest {
-                    version_info,
-                    protocol_id,
-                    expire_timestamp,
-                    xnonce,
-                    data: token_data,
+                    messages.push((message_id, payload.to_vec().into()));
+                }
+
+                Ok(Packet::SmallReliable {
+                    sequence,
+                    channel_id,
+                    messages,
                 })
             }
-            PacketType::Challenge => {
-                let token_sequence = read_u64(src)?;
-                let token_data = read_bytes(src)?;
+            1 => {
+                // SmallUnreliable
+                let sequence = b.get_varint()?;
+                let channel_id = b.get_u8()?;
+                let messages_len = b.get_u16()?;
+                let mut messages: Vec<Bytes> = Vec::with_capacity(64);
+                for _ in 0..messages_len {
+                    let payload = b.get_bytes_with_varint_length()?;
+                    messages.push(payload.to_vec().into());
+                }
 
-                Ok(Packet::Challenge {
-                    token_data,
-                    token_sequence,
+                Ok(Packet::SmallUnreliable {
+                    sequence,
+                    channel_id,
+                    messages,
                 })
             }
-            PacketType::Response => {
-                let token_sequence = read_u64(src)?;
-                let token_data = read_bytes(src)?;
+            2 => {
+                // ReliableSlice
+                let sequence = b.get_varint()?;
+                let channel_id = b.get_u8()?;
+                let message_id = b.get_varint()?;
+                let slice_index = b.get_varint()? as usize;
+                let num_slices = b.get_varint()? as usize;
+                if num_slices == 0 || num_slices > 1_000_000 {
+                    return Err(SerializationError::InvalidNumSlices);
+                }
 
-                Ok(Packet::Response {
-                    token_data,
-                    token_sequence,
-                })
-            }
-            PacketType::KeepAlive => {
-                let client_index = read_u32(src)?;
-                let max_clients = read_u32(src)?;
+                let payload = b.get_bytes_with_varint_length()?;
 
-                Ok(Packet::KeepAlive { client_index, max_clients })
-            }
-            PacketType::ConnectionDenied => Ok(Packet::ConnectionDenied),
-            PacketType::Disconnect => Ok(Packet::Disconnect),
-            PacketType::Payload => unreachable!(),
-        }
-    }
+                if payload.is_empty() {
+                    return Err(SerializationError::EmptySlice);
+                }
 
-    pub fn encode(&self, buffer: &mut [u8], protocol_id: u64, crypto_info: Option<(u64, &[u8; 32])>) -> Result<usize, NetcodeError> {
-        if matches!(self, Packet::ConnectionRequest { .. }) {
-            let mut writer = io::Cursor::new(buffer);
-            let prefix_byte = encode_prefix(self.id(), 0);
-            writer.write_all(&prefix_byte.to_le_bytes())?;
+                if payload.len() > SLICE_SIZE {
+                    return Err(SerializationError::SliceSizeAboveLimit);
+                }
 
-            self.write(&mut writer)?;
-            Ok(writer.position() as usize)
-        } else if let Some((sequence, private_key)) = crypto_info {
-            let (start, end, aad) = {
-                let mut writer = io::Cursor::new(&mut *buffer);
-                let prefix_byte = {
-                    let prefix_byte = encode_prefix(self.id(), sequence);
-                    writer.write_all(&prefix_byte.to_le_bytes())?;
-                    write_sequence(&mut writer, sequence)?;
-                    prefix_byte
+                let slice = Slice {
+                    message_id,
+                    slice_index,
+                    num_slices,
+                    payload: payload.to_vec().into(),
                 };
-
-                let start = writer.position() as usize;
-                self.write(&mut writer)?;
-
-                let additional_data = get_additional_data(prefix_byte, protocol_id);
-                (start, writer.position() as usize, additional_data)
-            };
-            if buffer.len() < end + NETCODE_MAC_BYTES {
-                return Err(NetcodeError::IoError(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "buffer too small to encode with encryption tag",
-                )));
+                Ok(Packet::ReliableSlice {
+                    sequence,
+                    channel_id,
+                    slice,
+                })
             }
+            3 => {
+                // UnreliableSlice
+                let sequence = b.get_varint()?;
+                let channel_id = b.get_u8()?;
+                let message_id = b.get_varint()?;
+                let slice_index = b.get_varint()? as usize;
+                let num_slices = b.get_varint()? as usize;
+                if num_slices == 0 || num_slices > 1_000_000 {
+                    return Err(SerializationError::InvalidNumSlices);
+                }
 
-            Ok(end + NETCODE_MAC_BYTES)
-        } else {
-            Err(NetcodeError::UnavailablePrivateKey)
+                let payload = b.get_bytes_with_varint_length()?;
+
+                let slice = Slice {
+                    message_id,
+                    slice_index,
+                    num_slices,
+                    payload: payload.to_vec().into(),
+                };
+                Ok(Packet::UnreliableSlice {
+                    sequence,
+                    channel_id,
+                    slice,
+                })
+            }
+            4 => {
+                // Ack
+                let sequence = b.get_varint()?;
+
+                let first_range_end = b.get_varint()?;
+                let first_range_size = b.get_varint()?;
+                let num_remaining_ranges = b.get_varint()?;
+
+                if first_range_end < first_range_size {
+                    return Err(SerializationError::InvalidAckRange);
+                }
+
+                let mut ack_ranges: Vec<Range<u64>> = Vec::with_capacity(32);
+
+                let first_range_start = first_range_end - first_range_size;
+                ack_ranges.push(first_range_start..first_range_end + 1);
+
+                let mut previous_range_start = first_range_start;
+                for _ in 0..num_remaining_ranges {
+                    // Get the gap between the previous range and the current one
+                    let gap = b.get_varint()?;
+
+                    if previous_range_start < 2 + gap {
+                        return Err(SerializationError::InvalidAckRange);
+                    }
+
+                    // Get the end of the current range using the start of the previous one and the gap
+                    let range_end = (previous_range_start - gap) - 2;
+                    let range_size = b.get_varint()?;
+
+                    if range_end < range_size {
+                        return Err(SerializationError::InvalidAckRange);
+                    }
+
+                    let range_start = range_end - range_size;
+                    ack_ranges.push(range_start..range_end + 1);
+
+                    previous_range_start = range_start;
+                }
+
+                ack_ranges.reverse();
+
+                Ok(Packet::Ack { sequence, ack_ranges })
+            }
+            _ => Err(SerializationError::InvalidPacketType),
         }
     }
-
-    pub fn decode(
-        mut buffer: &'a mut [u8],
-        protocol_id: u64,
-        private_key: Option<&[u8; 32]>,
-    ) -> Result<(u64, Self), NetcodeError> {
-        if buffer.len() < 2 + NETCODE_MAC_BYTES {
-            return Err(NetcodeError::PacketTooSmall);
-        }
-
-        let prefix_byte = buffer[0];
-        let (packet_type, sequence_len) = decode_prefix(prefix_byte);
-        let packet_type = PacketType::from_u8(packet_type)?;
-
-        if matches!(packet_type, PacketType::ConnectionRequest) {
-            Ok((0, Packet::read(PacketType::ConnectionRequest, &buffer[1..])?))
-        } else if let Some(private_key) = private_key {
-            let (sequence, aad, read_pos) = {
-                let src = &mut io::Cursor::new(&mut buffer);
-                src.set_position(1);
-                let sequence = read_sequence(src, sequence_len)?;
-                let additional_data = get_additional_data(prefix_byte, protocol_id);
-                (sequence, additional_data, src.position() as usize)
-            };
-
-            let packet = Packet::read(packet_type, &buffer[read_pos..buffer.len() - NETCODE_MAC_BYTES])?;
-            Ok((sequence, packet))
-        } else {
-            Err(NetcodeError::UnavailablePrivateKey)
-        }
-    }
-}
-
-impl ChallengeToken {
-    pub fn new(client_id: u64, user_data: &[u8; NETCODE_USER_DATA_BYTES]) -> Self {
-        Self {
-            client_id,
-            user_data: *user_data,
-        }
-    }
-
-    fn read(src: &mut impl io::Read) -> Result<Self, io::Error> {
-        let client_id = read_u64(src)?;
-        let user_data: [u8; NETCODE_USER_DATA_BYTES] = read_bytes(src)?;
-
-        Ok(Self { client_id, user_data })
-    }
-
-    fn write(&self, out: &mut impl io::Write) -> Result<(), io::Error> {
-        out.write_all(&self.client_id.to_le_bytes())?;
-        out.write_all(&self.user_data)?;
-
-        Ok(())
-    }
-
-    pub fn decode(
-        token_data: [u8; NETCODE_CHALLENGE_TOKEN_BYTES],
-        token_sequence: u64,
-        challenge_key: &[u8; NETCODE_KEY_BYTES],
-    ) -> Result<ChallengeToken, NetcodeError> {
-        let mut decoded = [0u8; NETCODE_CHALLENGE_TOKEN_BYTES];
-        decoded.copy_from_slice(&token_data);
-
-        Ok(ChallengeToken::read(&mut Cursor::new(&mut decoded))?)
-    }
-}
-
-fn get_additional_data(prefix: u8, protocol_id: u64) -> [u8; 13 + 8 + 1] {
-    let mut buffer = [0; 13 + 8 + 1];
-    buffer[..13].copy_from_slice(NETCODE_VERSION_INFO);
-    buffer[13..21].copy_from_slice(&protocol_id.to_le_bytes());
-    buffer[21] = prefix;
-
-    buffer
-}
-
-fn decode_prefix(value: u8) -> (u8, usize) {
-    ((value & 0xF), (value >> 4) as usize)
-}
-
-fn encode_prefix(value: u8, sequence: u64) -> u8 {
-    value | ((sequence_bytes_required(sequence) as u8) << 4)
-}
-
-fn sequence_bytes_required(sequence: u64) -> usize {
-    let mut mask: u64 = 0xFF00_0000_0000_0000;
-    for i in 0..8 {
-        if (sequence & mask) != 0x00 {
-            return 8 - i;
-        }
-
-        mask >>= 8;
-    }
-
-    0
-}
-
-fn write_sequence(out: &mut impl io::Write, seq: u64) -> Result<usize, io::Error> {
-    let len = sequence_bytes_required(seq);
-    let sequence_scratch = seq.to_le_bytes();
-    out.write(&sequence_scratch[..len])
-}
-
-fn read_sequence(source: &mut impl io::Read, len: usize) -> Result<u64, io::Error> {
-    let mut seq_scratch = [0; 8];
-    source.read_exact(&mut seq_scratch[0..len])?;
-    Ok(u64::from_le_bytes(seq_scratch))
 }
