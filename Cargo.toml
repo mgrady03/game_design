@@ -2,4 +2,7 @@
 
 members = [
     "game",
+    "network_channels",
+    "network_core",
+    "network_plugin",
 ]
